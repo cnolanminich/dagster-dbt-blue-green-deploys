@@ -1,0 +1,146 @@
+"""dbt Cloud variant of the duplicate check + time-travel revert flow.
+
+Named *.example so Dagster does not auto-load it. To activate alongside the
+dbt Cloud component:
+  1. Delete src/dbt_bluegreen_demo/defs/duplicate_checks/checks.py (the dbt
+     Core variant) — its asset_key bindings will collide otherwise.
+  2. Rename this file to checks.py.
+
+What's different vs the dbt Core variant?
+  * The asset_check is UNCHANGED. It queries Snowflake via SnowflakeResource;
+    it has no idea whether dbt is Core or Cloud.
+  * The sensor is UNCHANGED. It watches the Dagster event log for failed
+    check evaluations and emits a RunRequest.
+  * `revert_mart_orders` no longer shells out to a local `dbt run-operation`.
+    There is no local dbt install in a dbt Cloud setup. Instead it issues the
+    revert SQL directly via SnowflakeResource — the same statement the
+    `revert_via_time_travel` macro would have run, just sent over the
+    Snowflake connection rather than wrapped in a dbt invocation.
+
+Why direct SQL instead of triggering an ad-hoc dbt Cloud job?
+  * Lower latency — no warehouse-spin-up, no job queue, no API polling.
+    Reverts should be as fast as possible.
+  * Fewer moving parts — one Snowflake statement, one Snowflake auth path.
+  * Easier to reason about — the audit trail is "Dagster issued this SQL,"
+    not "Dagster called dbt Cloud which created a job which ran a macro
+    which issued this SQL."
+If your org's policy requires dbt Cloud as the sole writer, swap the
+SnowflakeResource call for a POST to /api/v2/accounts/{id}/jobs/{job_id}/run/
+with `steps_override: ["dbt run-operation revert_via_time_travel --args ..."]`.
+"""
+
+import os
+
+import dagster as dg
+from dagster_snowflake import SnowflakeResource
+
+
+MART_ORDERS_KEY = dg.AssetKey(["blue", "mart_orders"])
+REVERT_SECONDS = 600
+
+
+@dg.asset_check(
+    asset=MART_ORDERS_KEY,
+    name="no_duplicate_order_ids",
+    description="Fails if green.mart_orders has duplicate order_id values.",
+)
+def no_duplicate_order_ids(
+    context: dg.AssetCheckExecutionContext,
+    snowflake: SnowflakeResource,
+) -> dg.AssetCheckResult:
+    query = """
+        select count(*)
+        from (
+            select order_id
+            from green.mart_orders
+            group by order_id
+            having count(*) > 1
+        )
+    """
+    with snowflake.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(query)
+        duplicate_count = cur.fetchone()[0]
+
+    context.log.info(
+        f"duplicate check on green.mart_orders: {duplicate_count} duplicate order_id(s)"
+    )
+
+    return dg.AssetCheckResult(
+        passed=duplicate_count == 0,
+        severity=dg.AssetCheckSeverity.ERROR,
+        metadata={
+            "duplicate_order_ids": dg.IntMetadataValue(duplicate_count),
+            "checked_table": dg.TextMetadataValue("green.mart_orders"),
+        },
+    )
+
+
+@dg.op(
+    description=(
+        "Restores green.mart_orders via Snowflake Time Travel. Issues the "
+        "revert SQL directly through SnowflakeResource — no dbt Cloud job "
+        "is triggered."
+    ),
+)
+def revert_mart_orders(
+    context: dg.OpExecutionContext,
+    snowflake: SnowflakeResource,
+) -> None:
+    revert_sql = (
+        f"create or replace table green.mart_orders "
+        f"clone green.mart_orders at (offset => -{REVERT_SECONDS})"
+    )
+    context.log.info(f"running: {revert_sql}")
+    with snowflake.get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(revert_sql)
+    context.log.info("revert complete")
+
+
+@dg.job(
+    name="time_travel_revert_job",
+    description="Rolls back green.mart_orders when the duplicate check fails.",
+)
+def time_travel_revert_job() -> None:
+    revert_mart_orders()
+
+
+@dg.sensor(
+    name="duplicate_revert_sensor",
+    job=time_travel_revert_job,
+    default_status=dg.DefaultSensorStatus.RUNNING,
+    minimum_interval_seconds=30,
+    description=(
+        "Launches the time-travel revert job whenever no_duplicate_order_ids "
+        "fails on mart_orders."
+    ),
+)
+def duplicate_revert_sensor(context: dg.SensorEvaluationContext):
+    records = context.instance.event_log_storage.get_event_records(
+        dg.EventRecordsFilter(
+            event_type=dg.DagsterEventType.ASSET_CHECK_EVALUATION,
+            asset_key=MART_ORDERS_KEY,
+            after_cursor=int(context.cursor) if context.cursor else None,
+        ),
+        limit=20,
+        ascending=True,
+    )
+
+    if not records:
+        return
+
+    new_cursor = context.cursor
+    for record in records:
+        new_cursor = str(record.storage_id)
+        evaluation = record.asset_check_evaluation
+        if evaluation is None or evaluation.check_name != "no_duplicate_order_ids":
+            continue
+        if evaluation.passed:
+            continue
+        yield dg.RunRequest(
+            run_key=f"revert-{record.storage_id}",
+            tags={"triggered_by": "duplicate_revert_sensor"},
+        )
+
+    context.update_cursor(new_cursor)

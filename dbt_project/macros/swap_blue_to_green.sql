@@ -1,12 +1,8 @@
 {#
-  Promote a freshly-built blue table to green.
-
-  Snowflake: ALTER TABLE ... SWAP WITH — atomic metadata rename.
-    Consumers querying green either see the old table or the new one,
-    never a partial state. After the swap, blue holds what used to be in
-    green (kept until the next on-run-start clone overwrites it).
-
-  DuckDB:    no SWAP primitive — CTAS green from blue.
+  Promote a freshly-built blue table to green. Snowflake uses ALTER TABLE
+  ... SWAP WITH (atomic). DuckDB takes a snapshot of the current green
+  table, then CTAS's blue into green's place — the snapshot is what the
+  revert macro reads from.
 
   Called as a per-model post-hook on every mart.
 #}
@@ -59,8 +55,25 @@
     {% set green = var('green_schema') %}
     {% set blue = var('blue_schema') %}
     {% set tname = model_relation.identifier %}
+    {% set snapshot = tname ~ '__snapshot' %}
 
     {% do run_query("create schema if not exists " ~ green) %}
+
+    {% set green_exists_sql %}
+      select count(*)
+      from information_schema.tables
+      where table_schema = '{{ green }}' and table_name = '{{ tname }}'
+    {% endset %}
+    {% set result = run_query(green_exists_sql) %}
+    {% set green_exists = result.rows[0][0] > 0 %}
+
+    {% if green_exists %}
+      {% do log("DuckDB snapshot " ~ green ~ "." ~ tname ~ " -> " ~ green ~ "." ~ snapshot, info=True) %}
+      {% do run_query(
+            "create or replace table " ~ green ~ "." ~ snapshot
+            ~ " as select * from " ~ green ~ "." ~ tname
+      ) %}
+    {% endif %}
 
     {% do log("DuckDB promote " ~ blue ~ "." ~ tname ~ " -> " ~ green ~ "." ~ tname, info=True) %}
     {% do run_query(
