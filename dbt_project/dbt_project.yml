@@ -26,6 +26,12 @@ vars:
 on-run-start:
   - "{{ clone_green_to_blue() }}"
 
+# Promote marts to green only after every model AND every test has run
+# cleanly. Per-model post-hooks fire before tests, so they cannot be used
+# for safe promotion. See macros/swap_all_marts_if_clean.sql.
+on-run-end:
+  - "{{ swap_all_marts_if_clean() }}"
+
 seeds:
   bluegreen_analytics:
     +schema: raw
@@ -39,4 +45,3 @@ models:
     marts:
       +schema: blue
       +materialized: table
-      +post-hook: "{{ swap_blue_to_green(this) }}"

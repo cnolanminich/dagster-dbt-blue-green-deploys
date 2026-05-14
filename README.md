@@ -72,7 +72,34 @@ warehouse but the orchestration shape doesn't.
 | --- | --- | --- | --- |
 | Clone green → blue | dbt `on-run-start` hook | `CREATE OR REPLACE SCHEMA blue CLONE green` (one zero-copy metadata op) | `CREATE OR REPLACE TABLE blue.x AS SELECT * FROM green.x` per table |
 | Build into blue | dbt model materializations | normal `dbt build` into the `blue` schema | normal `dbt build` into the `blue` schema |
-| Promote blue → green | per-model dbt `post-hook` | `ALTER TABLE blue.x SWAP WITH green.x` (atomic rename) | snapshot `green.x → green.x__snapshot`, then `CREATE OR REPLACE TABLE green.x AS SELECT * FROM blue.x` |
+| Promote blue → green | dbt `on-run-end` hook (only if all models built and all tests passed) | `ALTER TABLE blue.x SWAP WITH green.x` per mart (atomic rename) | snapshot `green.x → green.x__snapshot`, then `CREATE OR REPLACE TABLE green.x AS SELECT * FROM blue.x` per mart |
+
+### Why on-run-end and not per-model post-hook
+
+dbt's `post-hook` fires after a model's SQL completes but **before** the
+tests dbt scheduled on that model. Using post-hook for promotion means a bad
+model is already swapped into green by the time its `unique` / `not_null`
+tests fail — exactly the case the blue/green flow is supposed to prevent.
+
+`on-run-end` is the first hook point where every model and every test has
+finished, and the `results` array is populated with each node's status. The
+[swap_all_marts_if_clean](dbt_project/macros/swap_all_marts_if_clean.sql)
+macro walks `results`, aborts if any node has status other than `success` or
+`pass`, and otherwise promotes every mart. Verified end-to-end against both
+test failures and model build errors — in both cases the swap is skipped and
+green retains its prior state.
+
+dbt invokes `on-run-end` whenever `execute_nodes()` returns, **including
+when models or tests failed** (failures live in the results array, not as
+raised exceptions). It is skipped only on catastrophic errors — parse
+failure, `on-run-start` raising, or the process being killed — in which case
+nothing was published anyway, so green stays untouched either way.
+
+The trade-off is **all-or-nothing batch promotion**: one failed test means
+*no* mart promotes, even ones whose tests passed. The alternative — walking
+the test results to figure out which models have all-passing tests and aren't
+downstream of any failed node — is more complex and the partial-success case
+is usually best handled by "rerun after fixing the broken model."
 
 ### What you get
 
@@ -85,11 +112,14 @@ warehouse but the orchestration shape doesn't.
 
 ### What you don't get
 
-- **Cross-table consistency during a build.** Per-model post-hook swap means
-  consumers can briefly see a new `mart_orders` joined against an old
-  `mart_customers`. If you need atomic multi-table cutover, move the swap to
-  an `on-run-end` hook — the trade-off is that one bad model rejects the
-  whole batch.
+- **Cross-table consistency during the swap window.** The swap iterates marts
+  inside the `on-run-end` hook, so each `ALTER TABLE SWAP WITH` (Snowflake)
+  or `CREATE OR REPLACE` (DuckDB) is its own statement. There is a brief
+  window where some marts have been promoted and others haven't — consumers
+  reading multiple marts in that window can see mixed old/new. Closing this
+  window fully requires view-aliasing (e.g., have consumers query
+  `live.mart_orders` which is a view that points at either green_a or
+  green_b, and flip the view in a single statement at the end).
 
 ## Approach 2: asset check + time-travel revert
 
@@ -271,12 +301,13 @@ dbt_bluegreen_demo/
 │   ├── macros/
 │   │   ├── clone_green_to_blue.sql       # adapter.dispatch: snowflake__/duckdb__
 │   │   ├── swap_blue_to_green.sql        # adapter.dispatch: snowflake__/duckdb__
+│   │   ├── swap_all_marts_if_clean.sql   # on-run-end orchestrator, walks results
 │   │   ├── revert_via_time_travel.sql    # adapter.dispatch: snowflake__/duckdb__
 │   │   └── generate_schema_name.sql      # +schema: blue → "blue" literally
 │   ├── seeds/                            # raw_orders.csv, raw_customers.csv
 │   └── models/
 │       ├── staging/                      # stg_orders, stg_customers
-│       └── marts/                        # mart_orders, mart_customers (post-hook swap)
+│       └── marts/                        # mart_orders, mart_customers (promoted via on-run-end)
 └── src/dbt_bluegreen_demo/
     ├── components/
     │   ├── blue_green_dbt_component.py   # DbtProjectComponent subclass + demo_mode
@@ -297,6 +328,7 @@ dbt_bluegreen_demo/
 | --- | --- | --- |
 | `BLUEGREEN_DEMO_MODE` | `checks.py` to decide DuckDB vs Snowflake at check time | `true` |
 | `BLUEGREEN_SIMULATE_DUPLICATES` | `checks.py` injects a duplicate row into green.mart_orders so the check fails (DuckDB only) | `false` |
+| `BLUEGREEN_SIMULATE_SWAP_FAILURE` | `swap_all_marts_if_clean` macro skips the swap even when the build is clean — for demoing the failure path without editing models | `false` |
 | `BLUEGREEN_DUCKDB_PATH` | `profiles.yml` for the duckdb_demo target | `dbt_project/.local/demo.duckdb` |
 | `SNOWFLAKE_*` | `profiles.yml` snowflake_prod target and Dagster `SnowflakeResource` | placeholder values |
 | `DBT_CLOUD_ACCOUNT_ID`, `DBT_CLOUD_PROJECT_ID`, `DBT_CLOUD_ENVIRONMENT_ID`, `DBT_CLOUD_API_TOKEN` | `dbt_blue_green_cloud/defs.yaml.example` | unset (required if activated) |
@@ -310,8 +342,9 @@ dbt_bluegreen_demo/
 - The DuckDB `__snapshot` is only the *previous* state. Two bad runs in a row
   and the snapshot is bad too. Snowflake Time Travel is bounded by the
   retention window (1 day default, 90 max).
-- Per-model post-hook swap means cross-table inconsistency during a build is
-  visible to consumers. Move to `on-run-end` for atomic multi-table cutover.
+- The `on-run-end` swap iterates marts; each statement is independent. For
+  fully atomic multi-mart cutover, use view aliasing (consumers query a view
+  that flips between two green slots) rather than direct table swap.
 
 ## Learn more
 

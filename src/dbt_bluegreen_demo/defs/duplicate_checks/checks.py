@@ -19,6 +19,9 @@ from pathlib import Path
 
 import dagster as dg
 import duckdb
+from dagster._core.storage.asset_check_execution_record import (
+    AssetCheckExecutionRecordStatus,
+)
 from dagster_snowflake import SnowflakeResource
 
 
@@ -27,6 +30,9 @@ DUCKDB_PATH = DBT_PROJECT_DIR / ".local" / "demo.duckdb"
 
 # dbt's blue-schema models become assets prefixed with `blue/`.
 MART_ORDERS_KEY = dg.AssetKey(["blue", "mart_orders"])
+DUPLICATE_CHECK_KEY = dg.AssetCheckKey(
+    asset_key=MART_ORDERS_KEY, name="no_duplicate_order_ids"
+)
 REVERT_SECONDS = 600
 
 
@@ -151,30 +157,33 @@ def time_travel_revert_job() -> None:
     ),
 )
 def duplicate_revert_sensor(context: dg.SensorEvaluationContext):
-    records = context.instance.event_log_storage.get_event_records(
-        dg.EventRecordsFilter(
-            event_type=dg.DagsterEventType.ASSET_CHECK_EVALUATION,
-            asset_key=MART_ORDERS_KEY,
-            after_cursor=int(context.cursor) if context.cursor else None,
-        ),
-        limit=20,
-        ascending=True,
+    # Asset check events live in a dedicated storage table, queried via the
+    # asset-check-specific API rather than the generic event log filter.
+    latest_by_key = context.instance.event_log_storage.get_latest_asset_check_execution_by_key(
+        check_keys=[DUPLICATE_CHECK_KEY]
     )
+    latest = latest_by_key.get(DUPLICATE_CHECK_KEY)
 
-    if not records:
+    if latest is None:
+        context.log.debug("no asset check executions for the duplicate check yet")
         return
 
-    new_cursor = context.cursor
-    for record in records:
-        new_cursor = str(record.storage_id)
-        evaluation = record.asset_check_evaluation
-        if evaluation is None or evaluation.check_name != "no_duplicate_order_ids":
-            continue
-        if evaluation.passed:
-            continue
-        yield dg.RunRequest(
-            run_key=f"revert-{record.storage_id}",
-            tags={"triggered_by": "duplicate_revert_sensor"},
-        )
+    last_seen = int(context.cursor) if context.cursor else 0
+    if latest.id <= last_seen:
+        return
 
-    context.update_cursor(new_cursor)
+    context.update_cursor(str(latest.id))
+
+    if latest.status != AssetCheckExecutionRecordStatus.FAILED:
+        context.log.info(
+            f"check execution {latest.id} status={latest.status.name} — no revert needed"
+        )
+        return
+
+    context.log.info(
+        f"check execution {latest.id} FAILED — launching time_travel_revert_job"
+    )
+    yield dg.RunRequest(
+        run_key=f"revert-{latest.id}",
+        tags={"triggered_by": "duplicate_revert_sensor"},
+    )
