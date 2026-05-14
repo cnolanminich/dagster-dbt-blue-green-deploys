@@ -1,0 +1,17 @@
+version: 2
+
+models:
+  - name: stg_orders
+    description: Cleaned order events, one row per order.
+    columns:
+      - name: order_id
+        description: Primary key.
+        tests:
+          - not_null
+  - name: stg_customers
+    description: Cleaned customer dimension, one row per customer.
+    columns:
+      - name: customer_id
+        description: Primary key.
+        tests:
+          - not_null

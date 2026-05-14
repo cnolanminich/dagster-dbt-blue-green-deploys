@@ -1,0 +1,29 @@
+version: 2
+
+models:
+  - name: mart_orders
+    description: Order fact table, one row per order, enriched with customer email.
+    columns:
+      - name: order_id
+        description: Primary key — duplicates here trigger a time-travel revert.
+        tests:
+          - not_null
+          - unique
+      - name: customer_id
+      - name: customer_email
+      - name: order_total
+      - name: ordered_at
+      - name: ordered_date
+
+  - name: mart_customers
+    description: Customer dimension with lifetime aggregates.
+    columns:
+      - name: customer_id
+        description: Primary key.
+        tests:
+          - not_null
+          - unique
+      - name: email
+      - name: lifetime_orders
+      - name: lifetime_revenue
+      - name: last_order_at

@@ -1,0 +1,7 @@
+customer_id,email,signed_up_at
+1,alice@example.com,2026-01-12 10:00:00
+2,bob@example.com,2026-02-03 14:21:00
+3,carol@example.com,2026-02-15 08:30:00
+4,dave@example.com,2026-03-01 09:45:00
+5,eve@example.com,2026-03-22 16:10:00
+6,frank@example.com,2026-04-05 12:00:00

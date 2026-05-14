@@ -1,0 +1,23 @@
+bluegreen_analytics:
+  target: duckdb_demo
+  outputs:
+    # ----- DuckDB target (used by demo_mode=true in Dagster) ---------------
+    # Local file under dbt_project/.local/demo.duckdb. Zero setup — just runs.
+    duckdb_demo:
+      type: duckdb
+      path: "{{ env_var('BLUEGREEN_DUCKDB_PATH', '/Users/christian/code/demos/dbt_bluegreen_demo/dbt_project/.local/demo.duckdb') }}"
+      schema: blue
+      threads: 4
+
+    # ----- Snowflake target (used by demo_mode=false in Dagster) ----------
+    snowflake_prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT', 'demo_account') }}"
+      user: "{{ env_var('SNOWFLAKE_USER', 'demo_user') }}"
+      password: "{{ env_var('SNOWFLAKE_PASSWORD', 'demo_password') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE', 'TRANSFORMER') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE', 'TRANSFORMING') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE', 'ANALYTICS_DB') }}"
+      schema: blue
+      threads: 4
+      client_session_keep_alive: false

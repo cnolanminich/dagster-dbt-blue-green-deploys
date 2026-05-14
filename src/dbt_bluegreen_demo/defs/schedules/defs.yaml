@@ -1,0 +1,25 @@
+# Hourly blue/green build — clones green->blue, builds all dbt models into blue,
+# swaps each mart into green on its post-hook.
+type: dbt_bluegreen_demo.components.scheduled_job_component.ScheduledJobComponent
+
+attributes:
+  job_name: hourly_blue_green_build
+  cron_schedule: "0 * * * *"
+  asset_selection: "kind:dbt"
+---
+# Marts-only refresh — runs every 15 minutes against the mart layer, post-swap
+# the duplicate check fires automatically. Useful for high-cadence verticals.
+type: dbt_bluegreen_demo.components.scheduled_job_component.ScheduledJobComponent
+
+attributes:
+  job_name: marts_blue_green_build
+  cron_schedule: "*/15 * * * *"
+  asset_selection: "tag:layer=marts"
+---
+# Daily full rebuild — catches any cumulative drift overnight.
+type: dbt_bluegreen_demo.components.scheduled_job_component.ScheduledJobComponent
+
+attributes:
+  job_name: daily_full_rebuild
+  cron_schedule: "0 4 * * *"
+  asset_selection: "kind:dbt"

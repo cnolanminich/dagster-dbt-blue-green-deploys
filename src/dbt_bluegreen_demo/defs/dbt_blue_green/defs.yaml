@@ -1,0 +1,15 @@
+type: dbt_bluegreen_demo.components.blue_green_dbt_component.BlueGreenDbtComponent
+
+attributes:
+  # Flip to false once SNOWFLAKE_* env vars are populated to run the real
+  # dbt build → blue/green swap against Snowflake.
+  demo_mode: true
+
+  project:
+    project_dir: ../../../../dbt_project
+
+  op:
+    name: dbt_blue_green_build
+
+  cli_args:
+    - build

@@ -1,0 +1,59 @@
+# dbt Cloud variant of the blue/green flow.
+#
+# This file is named *.example so Dagster does not auto-load it. To activate:
+#   1. Set the DBT_CLOUD_* env vars (account/project/environment IDs + token).
+#   2. Rename this file to `defs.yaml`.
+#   3. Either delete src/dbt_bluegreen_demo/defs/dbt_blue_green/defs.yaml (to
+#      switch the project over entirely) or add a `translation.key_prefix:
+#      cloud` here to keep both side-by-side without asset-key collisions.
+#
+# What's different vs the dbt Core variant?
+#   * The dbt project itself is UNCHANGED. The on-run-start clone, per-model
+#     post-hook swap, and adapter.dispatch macros all live in the project repo,
+#     which is the same repo dbt Cloud points its environment at.
+#   * Dagster no longer runs dbt as a subprocess. It triggers a dbt Cloud job
+#     via the v2 API. Credentials, profiles.yml, and warehouse config live in
+#     the dbt Cloud environment, not in this repo.
+#   * Asset keys, lineage, and metadata are imported from dbt Cloud's manifest.
+#     The schedules in defs/schedules/defs.yaml still work — they target the
+#     same asset selection ("kind:dbt").
+
+type: dagster_dbt.DbtCloudComponent
+
+attributes:
+  workspace:
+    account_id: "{{ env_var('DBT_CLOUD_ACCOUNT_ID') }}"
+    project_id: "{{ env_var('DBT_CLOUD_PROJECT_ID') }}"
+    environment_id: "{{ env_var('DBT_CLOUD_ENVIRONMENT_ID') }}"
+    token: "{{ env_var('DBT_CLOUD_API_TOKEN') }}"
+    # Optional — defaults to https://cloud.getdbt.com
+    access_url: "{{ env_var('DBT_CLOUD_ACCESS_URL', 'https://cloud.getdbt.com') }}"
+
+  # `dbt build` runs the same on-run-start clone + per-model post-hook swap
+  # macros as the dbt Core variant. dbt Cloud injects this as an ad-hoc step
+  # in the configured environment's job.
+  cli_args:
+    - build
+
+  op:
+    name: dbt_blue_green_cloud_build
+
+  # Translate dbt Cloud's asset specs to match the rest of the project.
+  # Drop or change key_prefix if you want the cloud-built assets to live at
+  # the same keys as the dbt Core variant (only do this if you've removed the
+  # dbt_blue_green/ folder — otherwise you'll get duplicate-key errors).
+  translation:
+    group_name: blue_green_marts
+    tags:
+      orchestrator: dagster
+      executed_by: dbt_cloud
+    kinds:
+      - dbt
+      - snowflake
+
+  # State-backed component: caches the dbt Cloud manifest locally so Dagster
+  # can load asset specs without hitting the dbt Cloud API on every reload.
+  # Refresh via `dg utils refresh-defs-state` in CI/CD before deploy.
+  defs_state:
+    management_type: versioned_state_storage
+    refresh_if_dev: true

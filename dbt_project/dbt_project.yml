@@ -1,0 +1,42 @@
+name: bluegreen_analytics
+version: "1.0.0"
+
+profile: bluegreen_analytics
+config-version: 2
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "dbt_packages"]
+
+# Blue/green deployment:
+#   * Models build into the "blue" (staging) schema.
+#   * on-run-start clones the live "green" tables into "blue".
+#   * Each mart's post-hook calls swap_blue_to_green to atomically promote it.
+#   * revert_via_time_travel restores a single table from a snapshot.
+#
+# The macros dispatch on adapter type — Snowflake uses true zero-copy clones
+# and time-travel; DuckDB uses CTAS and an explicit snapshot table.
+vars:
+  green_schema: green
+  blue_schema: blue
+  raw_schema: raw
+
+on-run-start:
+  - "{{ clone_green_to_blue() }}"
+
+seeds:
+  bluegreen_analytics:
+    +schema: raw
+    +quote_columns: false
+
+models:
+  bluegreen_analytics:
+    staging:
+      +schema: blue
+      +materialized: view
+    marts:
+      +schema: blue
+      +materialized: table
+      +post-hook: "{{ swap_blue_to_green(this) }}"
