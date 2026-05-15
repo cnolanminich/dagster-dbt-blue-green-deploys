@@ -197,6 +197,111 @@ duplicate `order_id`"). If it fails:
 - You don't have a codifiable invariant beyond "looks right."
 - No downstream consumer whose harm you're trying to bound.
 
+## Blue/green for non-dbt assets (native Dagster)
+
+The dbt pattern above wraps the swap inside the dbt project. For pipelines
+that aren't dbt — e.g. a Python asset writing to DuckDB / Snowflake / a
+warehouse you don't model in dbt — the same shape works with native Dagster
+primitives: an asset, asset checks attached to it, and a downstream asset
+that uses Declarative Automation to gate on those checks.
+
+See [`src/dbt_bluegreen_demo/defs/native_blue_green/assets.py`](src/dbt_bluegreen_demo/defs/native_blue_green/assets.py).
+
+### The pattern
+
+```
+blue_orders  ──┐
+                ├─ 4 asset checks on blue_orders ──┐
+                │   row_count_positive             │
+                │   no_null_order_id               ├─→ green_orders
+                │   no_duplicate_order_id          │   (eager + check-gated)
+                │   all_totals_positive            │
+                └──────────────────────────────────┘
+```
+
+`green_orders` carries this `AutomationCondition`:
+
+```python
+green_orders_condition = (
+    dg.AutomationCondition.eager()
+    & dg.AutomationCondition.all_deps_match(
+        dg.AutomationCondition.all_checks_match(
+            dg.AutomationCondition.check_passed()
+        )
+    )
+)
+```
+
+- **`eager()`** — base condition: fire when `blue_orders` is newly updated
+  and no run is in progress.
+- **`all_deps_match(all_checks_match(check_passed()))`** — for every upstream
+  dep, every check on that dep currently has a passing latest evaluation.
+  Combined with `eager()`, this means: "blue just updated, no run in flight,
+  and every check on blue currently passes."
+
+If any check fails, the condition is false; `green_orders` is not requested
+and green stays at its prior state. After fixing the upstream issue and
+re-materializing `blue_orders`, the next evaluation tick sees the checks
+back to passing and promotes green automatically.
+
+### Setup
+
+The `default_automation_condition_sensor` must be enabled in the Dagster UI
+under **Automation → Sensors**. Without that, the condition is never
+evaluated and `green_orders` never auto-fires.
+
+The first materialization of `blue_orders` won't trigger `green_orders` via
+the daemon — `green_orders` is `missing()` at that point but `eager()`
+requires `newly_updated()` (and the asset can't be newly_updated until it
+has been materialized at least once). Either materialize `green_orders`
+manually once to bootstrap, or replace `eager()` with `eager() |
+(missing() & all_deps_match(...))` if you want bootstrap behavior baked in.
+
+### Trying it
+
+```bash
+# Materialize blue + its 4 checks
+uv run dagster asset materialize --select 'key:"native/blue/orders"' \
+    -m dbt_bluegreen_demo.definitions
+
+# In `dg dev` with the automation sensor enabled, green will fire automatically.
+# For a one-shot demo without the daemon, materialize green manually:
+uv run dagster asset materialize --select 'key:"native/green/orders"' \
+    -m dbt_bluegreen_demo.definitions
+```
+
+To demo the failure path, pass `corrupt: true` as run config. The flag is a
+per-run `dg.Config` so it can be flipped from the UI launchpad without
+restarting the code location, or via CLI:
+
+```bash
+uv run dagster asset materialize \
+    --select 'key:"native/blue/orders"' \
+    --config-json '{"ops": {"native__blue__orders": {"config": {"corrupt": true}}}}' \
+    -m dbt_bluegreen_demo.definitions
+```
+
+(The op name `native__blue__orders` is Dagster's auto-generated name from the
+asset key path — each segment joined by `__`.)
+
+The asset injects a duplicate `order_id` so `no_duplicate_order_id` fails
+(verified end-to-end: check record status → `FAILED`). The condition on
+`green_orders` evaluates to false; green stays put.
+
+### Trade-offs vs the dbt path
+
+| Aspect | dbt path | Native path |
+| --- | --- | --- |
+| Where the swap lives | dbt macros (`on-run-end` hook) | downstream asset materialization (`green_orders` writes the green table) |
+| Failure gate | macro inspects `results`, skips swap on any non-pass | `AutomationCondition` evaluates `all_checks_match(check_passed())` |
+| Atomicity (per table) | Snowflake `SWAP WITH` is atomic; DuckDB CTAS is not | depends on what `green_orders` does — could be `SWAP WITH`, `CREATE OR REPLACE`, or anything else |
+| Granularity | one all-or-nothing batch at end of dbt run | per-asset; you can have multiple greens with independent conditions |
+| Requires | dbt project + dbt invocation | Dagster + the automation sensor enabled |
+
+The native path is more flexible when you have a mix of dbt and non-dbt
+assets, or when greens have heterogeneous promotion rules. The dbt path is
+simpler when the entire blue/green flow is contained in a dbt build.
+
 ## Running on dbt Cloud
 
 The dbt project (macros, hooks, `dbt_project.yml`) is unchanged — dbt Cloud
@@ -318,6 +423,7 @@ dbt_bluegreen_demo/
         │   ├── defs.yaml.example                 # dbt Cloud variant of approach 1
         │   └── checks.py.example                 # dbt Cloud variant of approach 2
         ├── duplicate_checks/checks.py            # asset check + revert op + job + sensor
+        ├── native_blue_green/assets.py           # non-dbt blue/green via AutomationCondition
         ├── resources/resources.py                # SnowflakeResource
         └── schedules/defs.yaml                   # 3 schedules
 ```
